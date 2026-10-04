@@ -1,601 +1,251 @@
 -- ============================================================
--- AUTO COLLECT + SELL FISH — TANPA JEDA
--- Pond sendiri | Scan sekali | Collect + Sell instant
--- Remotes:
---   - bait.collectAllFish(uid)
---   - sellFish.sellAllFish()
+-- AUTO COLLECT + SELL FISH — 1 Tombol
 -- ============================================================
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Players = game:GetService("Players")
-local LocalPlayer = Players.LocalPlayer
+local LocalPlayer = game:GetService("Players").LocalPlayer
 
--- ====== DEPENDENCY ======
 local getPlayerDataById = require(ReplicatedStorage.TS.state["player-data"]).getPlayerDataById
 
--- ====== REMOTES ======
-local remoContainer = ReplicatedStorage
-    :WaitForChild("rbxts_include")
-    :WaitForChild("node_modules")
-    :WaitForChild("@rbxts")
-    :WaitForChild("remo")
-    :WaitForChild("src")
-    :WaitForChild("container")
-
-local collectFishRemote = remoContainer:WaitForChild("bait.collectAllFish")
-local sellAllFishRemote = remoContainer:WaitForChild("sellFish.sellAllFish")
-
--- ====== CONFIG ======
-local DEFAULT_CYCLE_INTERVAL = 0.5   -- jeda antar SIKLUS (bukan antar remote)
+local remo = ReplicatedStorage.rbxts_include.node_modules["@rbxts"].remo.src.container
+local collectRemote = remo:WaitForChild("bait.collectAllFish")
+local sellRemote    = remo:WaitForChild("sellFish.sellAllFish")
 
 -- ====== STATE ======
-local autoRunEnabled = false
-local cycleInterval = DEFAULT_CYCLE_INTERVAL
-local mainThread = nil
-local currentUIDs = {}
-local collectSent = 0
-local sellSent = 0
-local failedCount = 0
-local cyclesDone = 0
-local autoSellEnabled = true
+local running = false
+local cycleInterval = 1.0
+local mainThread, currentUIDs = nil, {}
+local collectSent, sellSent, failed, cycles = 0, 0, 0, 0
+local isMin = false
 
--- ============================================================
--- HELPERS
--- ============================================================
-local function resolveBaitName(bait)
-    if type(bait) == "string" then return bait end
-    if type(bait) ~= "table" then return "?" end
-    for _, key in ipairs({ "baitType", "type", "baitId", "id", "name" }) do
-        local v = bait[key]
-        if type(v) == "string" then return v end
+-- ====== HELPERS ======
+local function baitName(b)
+    if type(b) == "string" then return b end
+    if type(b) ~= "table" then return "?" end
+    for _, k in ipairs({"baitType","type","baitId","id","name"}) do
+        if type(b[k]) == "string" then return b[k] end
     end
     return "unknown"
 end
 
-local function scanOwnPond()
-    local uids = {}
-    local ok, data = pcall(function()
-        return getPlayerDataById(tostring(LocalPlayer.UserId))
-    end)
-    if not ok or not data or not data.ponds then return uids end
+local function scanPond()
+    local out = {}
+    local ok, data = pcall(getPlayerDataById, tostring(LocalPlayer.UserId))
+    if not ok or not data or not data.ponds then return out end
     local pond = data.ponds[data.currentPond]
-    if not pond or not pond.baits then return uids end
-    for uid, bait in pairs(pond.baits) do
-        table.insert(uids, {
-            uid = tostring(uid),
-            baitType = resolveBaitName(bait),
-            mutation = (type(bait) == "table" and bait.mutation) or nil,
-            amount = (type(bait) == "table" and (bait.amount or bait.count)) or 1,
-            pond = tostring(data.currentPond),
-        })
+    if not pond or not pond.baits then return out end
+    for uid, b in pairs(pond.baits) do
+        table.insert(out, {uid = tostring(uid), baitType = baitName(b)})
     end
-    table.sort(uids, function(a, b) return a.uid < b.uid end)
-    return uids
+    table.sort(out, function(a,b) return a.uid < b.uid end)
+    return out
 end
 
-local function countFishInInventory()
-    local ok, data = pcall(function()
-        return getPlayerDataById(tostring(LocalPlayer.UserId))
-    end)
-    if not ok or not data or not data.inventory or not data.inventory.fishes then
-        return 0
-    end
-    local n = 0
-    for _ in pairs(data.inventory.fishes) do n = n + 1 end
-    return n
-end
-
--- ============================================================
--- GUI
--- ============================================================
-local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "AutoCollectSellGUI"
-screenGui.ResetOnSpawn = false
-screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-screenGui.Parent = game:GetService("CoreGui")
-
-local COLORS = {
-    bg = Color3.fromRGB(22, 24, 30),
-    panel = Color3.fromRGB(34, 37, 45),
-    panelAlt = Color3.fromRGB(44, 48, 58),
-    accent = Color3.fromRGB(88, 166, 255),
-    text = Color3.fromRGB(230, 232, 238),
-    textDim = Color3.fromRGB(150, 155, 165),
-    success = Color3.fromRGB(80, 200, 120),
-    danger = Color3.fromRGB(240, 90, 90),
-    warning = Color3.fromRGB(240, 180, 80),
-    sell = Color3.fromRGB(255, 180, 80),
+-- ====== GUI ======
+local C = {
+    bg=Color3.fromRGB(22,24,30), panel=Color3.fromRGB(32,35,42),
+    alt=Color3.fromRGB(44,48,58), accent=Color3.fromRGB(88,166,255),
+    text=Color3.fromRGB(230,232,238), dim=Color3.fromRGB(150,155,165),
+    ok=Color3.fromRGB(80,200,120), bad=Color3.fromRGB(240,90,90),
+    min=Color3.fromRGB(240,180,80),
 }
 
--- MAIN
-local main = Instance.new("Frame")
-main.Size = UDim2.new(0, 520, 0, 560)
-main.Position = UDim2.new(0.5, -260, 0.5, -280)
-main.BackgroundColor3 = COLORS.bg
-main.BorderSizePixel = 0
-main.Active = true
-main.Draggable = true
-main.Parent = screenGui
-Instance.new("UICorner", main).CornerRadius = UDim.new(0, 10)
+local FULL, MIN = UDim2.new(0,300,0,300), UDim2.new(0,160,0,28)
+
+local sg = Instance.new("ScreenGui")
+sg.Name, sg.ResetOnSpawn, sg.Parent = "AutoCS", false, game:GetService("CoreGui")
+
+local main = Instance.new("Frame", sg)
+main.Size, main.Position = FULL, UDim2.new(0.5,-150,0.5,-150)
+main.BackgroundColor3, main.BorderSizePixel = C.bg, 0
+main.Active, main.Draggable, main.ClipsDescendants = true, true, true
+Instance.new("UICorner", main).CornerRadius = UDim.new(0,8)
 local stroke = Instance.new("UIStroke", main)
-stroke.Color = COLORS.accent
-stroke.Thickness = 1
-stroke.Transparency = 0.5
+stroke.Color, stroke.Thickness, stroke.Transparency = C.accent, 1, 0.5
 
--- TITLE
-local titleBar = Instance.new("Frame", main)
-titleBar.Size = UDim2.new(1, 0, 0, 36)
-titleBar.BackgroundColor3 = COLORS.panel
-titleBar.BorderSizePixel = 0
-Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0, 10)
-local titleCover = Instance.new("Frame", titleBar)
-titleCover.Size = UDim2.new(1, 0, 0, 10)
-titleCover.Position = UDim2.new(0, 0, 1, -10)
-titleCover.BackgroundColor3 = COLORS.panel
-titleCover.BorderSizePixel = 0
+-- Title bar
+local bar = Instance.new("Frame", main)
+bar.Size, bar.BackgroundColor3, bar.BorderSizePixel = UDim2.new(1,0,0,28), C.panel, 0
+Instance.new("UICorner", bar).CornerRadius = UDim.new(0,8)
 
-local title = Instance.new("TextLabel", titleBar)
-title.Size = UDim2.new(1, -80, 1, 0)
-title.Position = UDim2.new(0, 12, 0, 0)
+local title = Instance.new("TextLabel", bar)
+title.Size, title.Position = UDim2.new(1,-80,1,0), UDim2.new(0,10,0,0)
 title.BackgroundTransparency = 1
-title.Text = "⚡  Auto Collect + Sell (No Delay)"
-title.TextColor3 = COLORS.text
-title.Font = Enum.Font.GothamBold
-title.TextSize = 14
+title.Text, title.TextColor3 = "⚡ Auto Collect + Sell", C.text
+title.Font, title.TextSize = Enum.Font.GothamBold, 12
 title.TextXAlignment = Enum.TextXAlignment.Left
 
-local closeBtn = Instance.new("TextButton", titleBar)
-closeBtn.Size = UDim2.new(0, 28, 0, 28)
-closeBtn.Position = UDim2.new(1, -34, 0, 4)
-closeBtn.BackgroundColor3 = COLORS.danger
-closeBtn.Text = "✕"
-closeBtn.TextColor3 = COLORS.text
-closeBtn.Font = Enum.Font.GothamBold
-closeBtn.TextSize = 14
-Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
-
--- ====== CONTROL PANEL ======
-local ctrl = Instance.new("Frame", main)
-ctrl.Size = UDim2.new(1, -20, 0, 110)
-ctrl.Position = UDim2.new(0, 10, 0, 46)
-ctrl.BackgroundColor3 = COLORS.panel
-ctrl.BorderSizePixel = 0
-Instance.new("UICorner", ctrl).CornerRadius = UDim.new(0, 8)
-
--- Toggle
-local toggleBtn = Instance.new("TextButton", ctrl)
-toggleBtn.Size = UDim2.new(0, 160, 0, 40)
-toggleBtn.Position = UDim2.new(0, 12, 0, 12)
-toggleBtn.BackgroundColor3 = COLORS.danger
-toggleBtn.Text = "▶  Start Auto"
-toggleBtn.TextColor3 = COLORS.text
-toggleBtn.Font = Enum.Font.GothamBold
-toggleBtn.TextSize = 14
-Instance.new("UICorner", toggleBtn).CornerRadius = UDim.new(0, 6)
-
--- Manual collect
-local manualCollectBtn = Instance.new("TextButton", ctrl)
-manualCollectBtn.Size = UDim2.new(0, 150, 0, 40)
-manualCollectBtn.Position = UDim2.new(0, 180, 0, 12)
-manualCollectBtn.BackgroundColor3 = COLORS.accent
-manualCollectBtn.Text = "📤  Collect"
-manualCollectBtn.TextColor3 = COLORS.text
-manualCollectBtn.Font = Enum.Font.GothamBold
-manualCollectBtn.TextSize = 13
-Instance.new("UICorner", manualCollectBtn).CornerRadius = UDim.new(0, 6)
-
--- Manual sell
-local manualSellBtn = Instance.new("TextButton", ctrl)
-manualSellBtn.Size = UDim2.new(0, 160, 0, 40)
-manualSellBtn.Position = UDim2.new(0, 338, 0, 12)
-manualSellBtn.BackgroundColor3 = COLORS.sell
-manualSellBtn.Text = "💰  Sell All"
-manualSellBtn.TextColor3 = COLORS.text
-manualSellBtn.Font = Enum.Font.GothamBold
-manualSellBtn.TextSize = 13
-Instance.new("UICorner", manualSellBtn).CornerRadius = UDim.new(0, 6)
-
--- Cycle interval input
-local cycleIntervalLbl = Instance.new("TextLabel", ctrl)
-cycleIntervalLbl.Size = UDim2.new(0, 100, 0, 20)
-cycleIntervalLbl.Position = UDim2.new(0, 12, 0, 60)
-cycleIntervalLbl.BackgroundTransparency = 1
-cycleIntervalLbl.Text = "Cycle jeda (s):"
-cycleIntervalLbl.TextColor3 = COLORS.textDim
-cycleIntervalLbl.Font = Enum.Font.Gotham
-cycleIntervalLbl.TextSize = 11
-cycleIntervalLbl.TextXAlignment = Enum.TextXAlignment.Left
-
-local cycleIntervalBox = Instance.new("TextBox", ctrl)
-cycleIntervalBox.Size = UDim2.new(0, 80, 0, 24)
-cycleIntervalBox.Position = UDim2.new(0, 115, 0, 58)
-cycleIntervalBox.BackgroundColor3 = COLORS.panelAlt
-cycleIntervalBox.BorderSizePixel = 0
-cycleIntervalBox.Text = tostring(DEFAULT_CYCLE_INTERVAL)
-cycleIntervalBox.TextColor3 = COLORS.text
-cycleIntervalBox.Font = Enum.Font.Code
-cycleIntervalBox.TextSize = 12
-cycleIntervalBox.ClearTextOnFocus = false
-Instance.new("UICorner", cycleIntervalBox).CornerRadius = UDim.new(0, 4)
-
-cycleIntervalBox.FocusLost:Connect(function()
-    local n = tonumber(cycleIntervalBox.Text)
-    if n and n >= 0 then
-        cycleInterval = n
-        statusBar.Text = "Cycle interval: " .. tostring(n) .. "s"
-    else
-        cycleIntervalBox.Text = tostring(cycleInterval)
-    end
-end)
-
--- Info label untuk jeda
-local delayInfoLbl = Instance.new("TextLabel", ctrl)
-delayInfoLbl.Size = UDim2.new(0, 200, 0, 24)
-delayInfoLbl.Position = UDim2.new(0, 200, 0, 58)
-delayInfoLbl.BackgroundTransparency = 1
-delayInfoLbl.Text = "⚡ Collect & Sell: instant (no delay)"
-delayInfoLbl.TextColor3 = COLORS.success
-delayInfoLbl.Font = Enum.Font.GothamBold
-delayInfoLbl.TextSize = 11
-delayInfoLbl.TextXAlignment = Enum.TextXAlignment.Left
-
--- Toggles row
-local autoSellToggle = Instance.new("TextButton", ctrl)
-autoSellToggle.Size = UDim2.new(0, 160, 0, 30)
-autoSellToggle.Position = UDim2.new(0, 12, 0, 88)
-autoSellToggle.BackgroundColor3 = COLORS.sell
-autoSellToggle.Text = "💰  Auto Sell: ON"
-autoSellToggle.TextColor3 = COLORS.text
-autoSellToggle.Font = Enum.Font.GothamBold
-autoSellToggle.TextSize = 12
-Instance.new("UICorner", autoSellToggle).CornerRadius = UDim.new(0, 6)
-
-local refreshBtn = Instance.new("TextButton", ctrl)
-refreshBtn.Size = UDim2.new(0, 150, 0, 30)
-refreshBtn.Position = UDim2.new(0, 180, 0, 88)
-refreshBtn.BackgroundColor3 = COLORS.accent
-refreshBtn.Text = "🔄  Rescan Pond"
-refreshBtn.TextColor3 = COLORS.text
-refreshBtn.Font = Enum.Font.GothamBold
-refreshBtn.TextSize = 12
-Instance.new("UICorner", refreshBtn).CornerRadius = UDim.new(0, 6)
-
-local clearLogBtn = Instance.new("TextButton", ctrl)
-clearLogBtn.Size = UDim2.new(0, 160, 0, 30)
-clearLogBtn.Position = UDim2.new(0, 338, 0, 88)
-clearLogBtn.BackgroundColor3 = COLORS.panelAlt
-clearLogBtn.Text = "🧹  Reset Counter"
-clearLogBtn.TextColor3 = COLORS.text
-clearLogBtn.Font = Enum.Font.GothamBold
-clearLogBtn.TextSize = 11
-Instance.new("UICorner", clearLogBtn).CornerRadius = UDim.new(0, 6)
-
--- ====== INFO BAR ======
-local infoBar = Instance.new("Frame", main)
-infoBar.Size = UDim2.new(1, -20, 0, 54)
-infoBar.Position = UDim2.new(0, 10, 0, 162)
-infoBar.BackgroundColor3 = COLORS.panelAlt
-infoBar.BorderSizePixel = 0
-Instance.new("UICorner", infoBar).CornerRadius = UDim.new(0, 6)
-
-local infoLbl1 = Instance.new("TextLabel", infoBar)
-infoLbl1.Size = UDim2.new(1, -20, 0, 26)
-infoLbl1.Position = UDim2.new(0, 10, 0, 0)
-infoLbl1.BackgroundTransparency = 1
-infoLbl1.Text = "Pond: - | Bait (snapshot): 0 | Fish in Inv: 0"
-infoLbl1.TextColor3 = COLORS.text
-infoLbl1.Font = Enum.Font.GothamBold
-infoLbl1.TextSize = 12
-infoLbl1.TextXAlignment = Enum.TextXAlignment.Left
-
-local infoLbl2 = Instance.new("TextLabel", infoBar)
-infoLbl2.Size = UDim2.new(1, -20, 0, 24)
-infoLbl2.Position = UDim2.new(0, 10, 0, 26)
-infoLbl2.BackgroundTransparency = 1
-infoLbl2.Text = "Collect: 0 | Sell: 0 | Cycles: 0 | Failed: 0"
-infoLbl2.TextColor3 = COLORS.textDim
-infoLbl2.Font = Enum.Font.Gotham
-infoLbl2.TextSize = 11
-infoLbl2.TextXAlignment = Enum.TextXAlignment.Left
-
--- ====== LIST HEADER ======
-local listHeader = Instance.new("Frame", main)
-listHeader.Size = UDim2.new(1, -20, 0, 24)
-listHeader.Position = UDim2.new(0, 10, 0, 224)
-listHeader.BackgroundTransparency = 1
-
-local h1 = Instance.new("TextLabel", listHeader)
-h1.Size = UDim2.new(0, 70, 1, 0)
-h1.Position = UDim2.new(0, 10, 0, 0)
-h1.BackgroundTransparency = 1
-h1.Text = "Type"
-h1.TextColor3 = COLORS.textDim
-h1.Font = Enum.Font.GothamBold
-h1.TextSize = 11
-h1.TextXAlignment = Enum.TextXAlignment.Left
-
-local h2 = Instance.new("TextLabel", listHeader)
-h2.Size = UDim2.new(0, 80, 1, 0)
-h2.Position = UDim2.new(0, 90, 0, 0)
-h2.BackgroundTransparency = 1
-h2.Text = "Mutation"
-h2.TextColor3 = COLORS.textDim
-h2.Font = Enum.Font.GothamBold
-h2.TextSize = 11
-h2.TextXAlignment = Enum.TextXAlignment.Left
-
-local h3 = Instance.new("TextLabel", listHeader)
-h3.Size = UDim2.new(1, -180, 1, 0)
-h3.Position = UDim2.new(0, 180, 0, 0)
-h3.BackgroundTransparency = 1
-h3.Text = "UID"
-h3.TextColor3 = COLORS.textDim
-h3.Font = Enum.Font.GothamBold
-h3.TextSize = 11
-h3.TextXAlignment = Enum.TextXAlignment.Left
-
--- ====== SCROLL LIST ======
-local scroll = Instance.new("ScrollingFrame", main)
-scroll.Size = UDim2.new(1, -20, 1, -280)
-scroll.Position = UDim2.new(0, 10, 0, 252)
-scroll.BackgroundColor3 = COLORS.panel
-scroll.BorderSizePixel = 0
-scroll.ScrollBarThickness = 6
-scroll.ScrollBarImageColor3 = COLORS.accent
-scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
-scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
-Instance.new("UICorner", scroll).CornerRadius = UDim.new(0, 6)
-
-local listLayout = Instance.new("UIListLayout", scroll)
-listLayout.SortOrder = Enum.SortOrder.LayoutOrder
-listLayout.Padding = UDim.new(0, 4)
-
-local listPad = Instance.new("UIPadding", scroll)
-listPad.PaddingTop = UDim.new(0, 6)
-listPad.PaddingBottom = UDim.new(0, 6)
-listPad.PaddingLeft = UDim.new(0, 6)
-listPad.PaddingRight = UDim.new(0, 6)
-
--- ====== STATUS ======
-local statusBar = Instance.new("TextLabel", main)
-statusBar.Size = UDim2.new(1, -20, 0, 30)
-statusBar.Position = UDim2.new(0, 10, 1, -38)
-statusBar.BackgroundTransparency = 1
-statusBar.Text = "Ready."
-statusBar.TextColor3 = COLORS.textDim
-statusBar.Font = Enum.Font.Gotham
-statusBar.TextSize = 11
-statusBar.TextXAlignment = Enum.TextXAlignment.Left
-statusBar.TextWrapped = true
-
--- ============================================================
--- RENDER
--- ============================================================
-local function createRow(bait, order)
-    local row = Instance.new("Frame")
-    row.Size = UDim2.new(1, 0, 0, 34)
-    row.BackgroundColor3 = COLORS.panelAlt
-    row.BorderSizePixel = 0
-    row.LayoutOrder = order
-    row.Parent = scroll
-    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 5)
-
-    local typeLbl = Instance.new("TextLabel", row)
-    typeLbl.Size = UDim2.new(0, 80, 1, 0)
-    typeLbl.Position = UDim2.new(0, 10, 0, 0)
-    typeLbl.BackgroundTransparency = 1
-    typeLbl.Text = "🎣 " .. tostring(bait.baitType)
-    typeLbl.TextColor3 = COLORS.text
-    typeLbl.Font = Enum.Font.GothamMedium
-    typeLbl.TextSize = 12
-    typeLbl.TextXAlignment = Enum.TextXAlignment.Left
-
-    local mutLbl = Instance.new("TextLabel", row)
-    mutLbl.Size = UDim2.new(0, 80, 1, 0)
-    mutLbl.Position = UDim2.new(0, 90, 0, 0)
-    mutLbl.BackgroundTransparency = 1
-    mutLbl.Text = tostring(bait.mutation or "-")
-    mutLbl.TextColor3 = COLORS.textDim
-    mutLbl.Font = Enum.Font.Gotham
-    mutLbl.TextSize = 11
-    mutLbl.TextXAlignment = Enum.TextXAlignment.Left
-
-    local uidLbl = Instance.new("TextLabel", row)
-    uidLbl.Size = UDim2.new(1, -180, 1, 0)
-    uidLbl.Position = UDim2.new(0, 180, 0, 0)
-    uidLbl.BackgroundTransparency = 1
-    uidLbl.Text = bait.uid
-    uidLbl.TextColor3 = COLORS.text
-    uidLbl.Font = Enum.Font.Code
-    uidLbl.TextSize = 11
-    uidLbl.TextXAlignment = Enum.TextXAlignment.Left
-    uidLbl.TextTruncate = Enum.TextTruncate.AtEnd
-
-    return row
+local function makeBtn(parent, size, pos, color, text, tsize)
+    local b = Instance.new("TextButton", parent)
+    b.Size, b.Position, b.BackgroundColor3 = size, pos, color
+    b.Text, b.TextColor3 = text, C.text
+    b.Font, b.TextSize = Enum.Font.GothamBold, tsize or 12
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0,5)
+    return b
 end
 
+local minBtn   = makeBtn(bar, UDim2.new(0,22,0,22), UDim2.new(1,-52,0,3), C.min, "—", 14)
+local closeBtn = makeBtn(bar, UDim2.new(0,22,0,22), UDim2.new(1,-26,0,3), C.bad, "✕", 12)
+
+-- Body
+local body = Instance.new("Frame", main)
+body.Size, body.Position, body.BackgroundTransparency = UDim2.new(1,0,1,-28), UDim2.new(0,0,0,28), 1
+
+-- ====== TOMBOL UTAMA (1 tombol) ======
+local mainBtn = makeBtn(body, UDim2.new(1,-16,0,44), UDim2.new(0,8,0,8), C.bad, "▶ Start Auto", 15)
+
+-- Info bar
+local info = Instance.new("TextLabel", body)
+info.Size, info.Position, info.BackgroundColor3 = UDim2.new(1,-16,0,32), UDim2.new(0,8,0,60), C.alt
+info.BorderSizePixel = 0
+info.Text, info.TextColor3 = "Bait: 0 | C:0 | S:0 | Cy:0 | F:0", C.text
+info.Font, info.TextSize = Enum.Font.Gotham, 11
+Instance.new("UICorner", info).CornerRadius = UDim.new(0,5)
+
+-- Scroll list
+local scroll = Instance.new("ScrollingFrame", body)
+scroll.Size, scroll.Position = UDim2.new(1,-16,1,-124), UDim2.new(0,8,0,100)
+scroll.BackgroundColor3, scroll.BorderSizePixel = C.panel, 0
+scroll.ScrollBarThickness, scroll.ScrollBarImageColor3 = 4, C.accent
+scroll.CanvasSize, scroll.AutomaticCanvasSize = UDim2.new(0,0,0,0), Enum.AutomaticSize.Y
+Instance.new("UICorner", scroll).CornerRadius = UDim.new(0,5)
+local ll = Instance.new("UIListLayout", scroll)
+ll.SortOrder, ll.Padding = Enum.SortOrder.LayoutOrder, UDim.new(0,2)
+local lp = Instance.new("UIPadding", scroll)
+lp.PaddingTop, lp.PaddingBottom = UDim.new(0,4), UDim.new(0,4)
+lp.PaddingLeft, lp.PaddingRight = UDim.new(0,4), UDim.new(0,4)
+
+local status = Instance.new("TextLabel", body)
+status.Size, status.Position = UDim2.new(1,-16,0,16), UDim2.new(0,8,1,-20)
+status.BackgroundTransparency = 1
+status.Text, status.TextColor3 = "Ready.", C.dim
+status.Font, status.TextSize = Enum.Font.Gotham, 10
+status.TextXAlignment, status.TextTruncate = Enum.TextXAlignment.Left, Enum.TextTruncate.AtEnd
+
+-- ====== MINIMIZE ======
+local savedPos = main.Position
+local function setMin(state)
+    isMin = state
+    if state then
+        savedPos = main.Position
+        body.Visible, closeBtn.Visible = false, false
+        minBtn.Text, minBtn.Position = "+", UDim2.new(1,-26,0,3)
+        main.Size, title.Text = MIN, "⚡ ACS"
+    else
+        body.Visible, closeBtn.Visible = true, true
+        minBtn.Text, minBtn.Position = "—", UDim2.new(1,-52,0,3)
+        main.Size, main.Position = FULL, savedPos
+        title.Text = "⚡ Auto Collect + Sell"
+    end
+end
+minBtn.MouseButton1Click:Connect(function() setMin(not isMin) end)
+title.InputBegan:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 and isMin then setMin(false) end
+end)
+
+-- ====== RENDER ======
 local function updateInfo()
-    local pondName = currentUIDs[1] and currentUIDs[1].pond or "-"
-    infoLbl1.Text = string.format("Pond: %s | Bait (snapshot): %d | Fish in Inv: %d",
-        pondName, #currentUIDs, countFishInInventory())
-    infoLbl2.Text = string.format("Collect: %d | Sell: %d | Cycles: %d | Failed: %d",
-        collectSent, sellSent, cyclesDone, failedCount)
+    info.Text = string.format("Bait: %d | C:%d | S:%d | Cy:%d | F:%d",
+        #currentUIDs, collectSent, sellSent, cycles, failed)
 end
 
 local function render()
-    for _, child in ipairs(scroll:GetChildren()) do
-        if child:IsA("Frame") then child:Destroy() end
+    for _, c in ipairs(scroll:GetChildren()) do
+        if c:IsA("Frame") then c:Destroy() end
     end
     for i, bait in ipairs(currentUIDs) do
-        createRow(bait, i)
+        local r = Instance.new("Frame", scroll)
+        r.Size, r.BorderSizePixel = UDim2.new(1,0,0,22), 0
+        r.BackgroundColor3 = i % 2 == 0 and C.alt or C.panel
+        r.LayoutOrder = i
+        Instance.new("UICorner", r).CornerRadius = UDim.new(0,3)
+
+        local t = Instance.new("TextLabel", r)
+        t.Size, t.Position, t.BackgroundTransparency = UDim2.new(0,80,1,0), UDim2.new(0,6,0,0), 1
+        t.Text, t.TextColor3 = tostring(bait.baitType), C.text
+        t.Font, t.TextSize = Enum.Font.GothamMedium, 10
+        t.TextXAlignment, t.TextTruncate = Enum.TextXAlignment.Left, Enum.TextTruncate.AtEnd
+
+        local u = Instance.new("TextLabel", r)
+        u.Size, u.Position, u.BackgroundTransparency = UDim2.new(1,-90,1,0), UDim2.new(0,90,0,0), 1
+        u.Text, u.TextColor3 = bait.uid, C.dim
+        u.Font, u.TextSize = Enum.Font.Code, 10
+        u.TextXAlignment, u.TextTruncate = Enum.TextXAlignment.Left, Enum.TextTruncate.AtEnd
     end
     updateInfo()
 end
 
--- ============================================================
--- CORE — TANPA JEDA
--- ============================================================
-local function sendCollect(uid)
-    local ok, err = pcall(function()
-        collectFishRemote:FireServer(uid)
-    end)
-    if ok then
-        collectSent = collectSent + 1
-        return true
-    else
-        failedCount = failedCount + 1
-        warn("[Collect] Error:", err)
-        return false
-    end
+-- ====== CORE ======
+local function collect(uid)
+    local ok = pcall(collectRemote.FireServer, collectRemote, uid)
+    if ok then collectSent = collectSent + 1 else failed = failed + 1 end
 end
 
-local function sendSellAll()
-    local ok, err = pcall(function()
-        sellAllFishRemote:FireServer()
-    end)
-    if ok then
-        sellSent = sellSent + 1
-        return true
-    else
-        failedCount = failedCount + 1
-        warn("[Sell] Error:", err)
-        return false
-    end
+local function sell()
+    local ok = pcall(sellRemote.FireServer, sellRemote)
+    if ok then sellSent = sellSent + 1 else failed = failed + 1 end
 end
 
--- Collect semua UID dalam snapshot — TANPA task.wait
-local function collectAllNow()
-    if #currentUIDs == 0 then
-        statusBar.Text = "⚠ Snapshot kosong. Klik Rescan Pond dulu."
-        return 0
-    end
-    local n = 0
-    for _, bait in ipairs(currentUIDs) do
-        if sendCollect(bait.uid) then n = n + 1 end
-        -- ❌ tidak ada task.wait di sini
-    end
-    updateInfo()
-    statusBar.Text = string.format("⚡ Collect instant %d/%d bait (no delay).", n, #currentUIDs)
-    return n
-end
-
--- ============================================================
--- MAIN LOOP
--- ============================================================
 local function runCycle()
+    -- scan ulang tiap siklus supaya UID fresh
+    currentUIDs = scanPond()
+    render()
+
     if #currentUIDs == 0 then
-        statusBar.Text = "⏳ Snapshot kosong. Klik Rescan Pond."
+        status.Text = "⏳ Pond kosong, tunggu..."
         return
     end
 
-    -- 1. Collect semua UID — INSTANT
-    local okCount = 0
-    for _, bait in ipairs(currentUIDs) do
-        if not autoRunEnabled then return end
-        if sendCollect(bait.uid) then okCount = okCount + 1 end
-        -- ❌ tidak ada jeda antar UID
+    -- 1) Collect semua UID (instant)
+    for _, b in ipairs(currentUIDs) do
+        if not running then return end
+        collect(b.uid)
     end
-    statusBar.Text = string.format("⚡ Collect instant: %d/%d", okCount, #currentUIDs)
-    updateInfo()
+    -- 2) Sell all (instant)
+    sell()
 
-    -- 2. Auto Sell — INSTANT (langsung setelah collect, tidak ada jeda)
-    if autoSellEnabled and autoRunEnabled then
-        if sendSellAll() then
-            statusBar.Text = "⚡ Collect + Sell instant selesai."
-        else
-            statusBar.Text = "✕ Sell All gagal."
-        end
-        updateInfo()
-    end
-
-    cyclesDone = cyclesDone + 1
+    cycles = cycles + 1
     updateInfo()
+    status.Text = string.format("⚡ Cycle #%d: %d collect + sell", cycles, #currentUIDs)
 end
 
-local function startMainLoop()
+local function startLoop()
     if mainThread then return end
     mainThread = task.spawn(function()
-        while autoRunEnabled and screenGui.Parent do
+        while running and sg.Parent do
             runCycle()
-            task.wait(cycleInterval)  -- jeda HANYA antar siklus
+            task.wait(cycleInterval)
         end
         mainThread = nil
     end)
 end
 
-local function stopMainLoop()
-    autoRunEnabled = false
-    if mainThread then
-        pcall(task.cancel, mainThread)
-        mainThread = nil
-    end
+local function stopLoop()
+    running = false
+    if mainThread then pcall(task.cancel, mainThread); mainThread = nil end
 end
 
--- ============================================================
--- EVENTS
--- ============================================================
-toggleBtn.MouseButton1Click:Connect(function()
-    autoRunEnabled = not autoRunEnabled
-    if autoRunEnabled then
-        toggleBtn.BackgroundColor3 = COLORS.success
-        toggleBtn.Text = "⏸  Stop Auto"
-        statusBar.Text = "⚡ Auto instant AKTIF (collect+sell tanpa jeda)."
-        startMainLoop()
+-- ====== SATU TOMBOL ======
+mainBtn.MouseButton1Click:Connect(function()
+    running = not running
+    if running then
+        mainBtn.BackgroundColor3 = C.ok
+        mainBtn.Text = "⏸ Stop Auto"
+        status.Text = "Auto collect + sell AKTIF."
+        startLoop()
     else
-        toggleBtn.BackgroundColor3 = COLORS.danger
-        toggleBtn.Text = "▶  Start Auto"
-        statusBar.Text = "Auto nonaktif."
-        stopMainLoop()
+        mainBtn.BackgroundColor3 = C.bad
+        mainBtn.Text = "▶ Start Auto"
+        status.Text = "Auto nonaktif."
+        stopLoop()
     end
-end)
-
-autoSellToggle.MouseButton1Click:Connect(function()
-    autoSellEnabled = not autoSellEnabled
-    if autoSellEnabled then
-        autoSellToggle.BackgroundColor3 = COLORS.sell
-        autoSellToggle.Text = "💰  Auto Sell: ON"
-    else
-        autoSellToggle.BackgroundColor3 = COLORS.panelAlt
-        autoSellToggle.Text = "💰  Auto Sell: OFF"
-    end
-end)
-
-manualCollectBtn.MouseButton1Click:Connect(function()
-    collectAllNow()
-end)
-
-manualSellBtn.MouseButton1Click:Connect(function()
-    if sendSellAll() then
-        statusBar.Text = "⚡ Sell All instant terkirim."
-    else
-        statusBar.Text = "✕ Sell All gagal."
-    end
-    updateInfo()
-end)
-
-refreshBtn.MouseButton1Click:Connect(function()
-    currentUIDs = scanOwnPond()
-    render()
-    statusBar.Text = "Rescan selesai: " .. #currentUIDs .. " bait."
-end)
-
-clearLogBtn.MouseButton1Click:Connect(function()
-    collectSent = 0
-    sellSent = 0
-    failedCount = 0
-    cyclesDone = 0
-    updateInfo()
-    statusBar.Text = "Counter di-reset."
 end)
 
 closeBtn.MouseButton1Click:Connect(function()
-    stopMainLoop()
-    screenGui:Destroy()
+    stopLoop()
+    sg:Destroy()
 end)
 
--- ============================================================
--- INIT — SCAN SEKALI
--- ============================================================
-currentUIDs = scanOwnPond()
+-- ====== INIT ======
+currentUIDs = scanPond()
 render()
-statusBar.Text = "Ready. Snapshot: " .. #currentUIDs .. " bait. Klik Start Auto untuk mulai."
-print("[AutoCollect+Sell] No-Delay mode. Snapshot bait:", #currentUIDs)
+status.Text = "Ready. Snapshot: " .. #currentUIDs .. " bait."
