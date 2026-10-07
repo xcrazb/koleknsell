@@ -17,7 +17,7 @@ local sellRemote    = remo:WaitForChild("sellFish.sellAllFish")
 
 -- ====== STATE (Fish) ======
 local fishRunning = false
-local cycleInterval = 0.5
+local cycleInterval = 0.25
 local fishThread, currentUIDs = nil, {}
 local collectSent, sellSent, failed, cycles = 0, 0, 0, 0
 
