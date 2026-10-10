@@ -17,7 +17,7 @@ local sellRemote    = remo:WaitForChild("sellFish.sellAllFish")
 
 -- ====== STATE (Fish) ======
 local fishRunning = false
-local cycleInterval = 0.25
+local cycleInterval = 0.3
 local fishThread, currentUIDs = nil, {}
 local collectSent, sellSent, failed, cycles = 0, 0, 0, 0
 
@@ -51,17 +51,17 @@ local placeRemote = remo:WaitForChild("ponds.placeBuilding")
 local SwitchPetLoadout = remo:WaitForChild("pets.switchPetLoadout")
 
 local Position = vector.create(24.862998962402344, -0.012000083923339844, -23)
-local PLACE_COUNT = 5
-local INTERVAL = 606
-local FEEDER_DELAY = 0.05
+local PLACE_COUNT = 10
+local INTERVAL = 300
+local FEEDER_DELAY = 0
 local SWITCH_DELAY = 0.1
 
 local Feeders = {
-    "GodlyAutoFeeder",
-    "ExtremeAutoFeeder",
-    "SupremeAutoFeeder",
-    "AdvancedAutoFeeder",
     "BasicAutoFeeder",
+    "AdvancedAutoFeeder",
+    "SupremeAutoFeeder",
+    "ExtremeAutoFeeder",
+    "GodlyAutoFeeder",
 }
 
 local feederRunning = false
